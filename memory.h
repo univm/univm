@@ -11,6 +11,7 @@
 #define CLRBIT(buf, bit) (buf &= ~(1 << bit))
 
 void hook_ins(uc_engine *uc, uint64_t address, uint32_t size, void *user_data);
+bool hook_mem_rw(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data);
 bool hook_invalid_mem(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data);
 int generic_map(uc_engine *uc, uint64_t address, size_t size, bool copyfrom_host=true, enum uc_prot prot=UC_PROT_ALL);
 int map_stack(uc_engine *uc, uint32_t address);

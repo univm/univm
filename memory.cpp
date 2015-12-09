@@ -12,22 +12,35 @@
 int generic_map(uc_engine *uc, uint64_t address, size_t size, bool copyfrom_host=true, enum uc_prot prot=UC_PROT_ALL)
 {
 	uint64_t address_align = align_address(address);
-	size_t size_align = align_size(size);
+	size_t size_align = align_size(size), overlap = 0;
 	unsigned char *data;
+	unsigned int i = mem_map.items;
 	uc_err err;
+
+	for(unsigned int k = 0; k < i; k++)
+	{
+		if((LODWORD(address_align)+size_align) >= mem_map.mem_block[k].start && (LODWORD(address_align)+size_align) <= mem_map.mem_block[k].end)
+		{
+			overlap = (LODWORD(address_align)+size_align) - mem_map.mem_block[k].start;
+			if(overlap == 0 && (LODWORD(address_align)+size_align) > mem_map.mem_block[k].start)
+				return 1;
+				
+			mylogprintf(PRINT, "Overlaps with %d!\n", overlap); // debug
+		}
+	}
 	
 	err = uc_mem_map(uc, address_align, size_align, prot);
 	if(err != UC_ERR_OK)
 	{
 		mylogprintf(PRINT, "[UniVM] Failed to map memory at address 0x%016X(size %Iu) with error: %s\n", address_align, size_align, uc_strerror(err));
-		return false;
+		return -1;
 	}
 	
 	if(copyfrom_host)
 	{
 		data = new unsigned char[size_align]();
 	
-		if(!DbgMemRead(LODWORD(address_align), data, size))
+		if(!DbgMemRead(LODWORD(address_align), data, size_align-overlap))
 		{
 			if(GetLastError() != 299)
 			{
@@ -35,33 +48,39 @@ int generic_map(uc_engine *uc, uint64_t address, size_t size, bool copyfrom_host
 				{
 					mylogprintf(PRINT, "[UniVM] Failed to DbgMemRead at UC_MEM_WRITE_UNMAPPED of 0x%08X with error code %d", LODWORD(address_align), GetLastError());
 					delete[] data;
-					return false;
+					return -1;
 				}
 			}
 		
 			//mylogprintf(PRINT, "[UniVM] WARNING: DbgMemRead only did a partial copy of memory at address 0x%08X(size %lu) with error code %d. This is not fatal.", LODWORD(address_align), size_align, GetLastError());
 		}
 			
-		err = uc_mem_write(uc, address_align, data, size);
+		err = uc_mem_write(uc, address_align, data, size_align-overlap);
 		if(err != UC_ERR_OK)
 		{
 			delete[] data;
-			mylogprintf(PRINT, "[UniVM] Failed to write data, %s(sz %d)\n", uc_strerror(err), size);
-			return false;
+			mylogprintf(PRINT, "[UniVM] Failed to write data, %s(sz %d)\n", uc_strerror(err), size_align-overlap);
+			return -1;
 		}	
 	
 		delete[] data;
 	}
 	
-	unsigned int i = mem_map.items;
-	if(i < sizeof(mem_map.mem_block))
-	{
-		mem_map.mem_block[i].start = address_align;
-		mem_map.mem_block[i].end = address_align + size_align;
-		mem_map.mem_block[i].size = size_align;
-		mem_map.mem_block[i].req = size;
-		mem_map.items++;
-	}
+	//must make mem_map dynamic and check that `i` isn't bigger than the size of mem_block
+	mem_map.mem_block[i].start = address_align;
+	mem_map.mem_block[i].end = address_align + size_align;
+	mem_map.mem_block[i].size = size_align;
+	mem_map.mem_block[i].req = size;
+	mem_map.items++;	
+	
+	return 1;
+}
+
+int mem_unmap(uc_engine *uc, uint64_t address, size_t size)
+{
+	uint64_t address_align = align_address(address);
+	size_t size_align = align_size(size);
+	uc_err err;
 }
 
 int map_stack(uc_engine *uc, addr_t address)
@@ -78,9 +97,11 @@ int map_stack(uc_engine *uc, addr_t address)
 		
 	}
 	
-	mylogprintf(PRINT, "[UniVM] Early mapping of stack %08X-%08X(aligned to %08X). %u bytes will be mapped.",stklimit, stkbase, base_align, size_align);
+	mylogprintf(PRINT, "[UniVM] Early mapping of stack %08X-%08X(aligned to %08X). %u bytes will be mapped and %08X.",stklimit, stkbase, base_align, size_align, base_align - size_align);
 	
 	err = generic_map(uc, base_align - size_align , size_align);
+	if(!err)
+		mylogprintf(PRINT, "[UniVM] Failed to map stack. ");
 	//err = generic_map(uc, align_address(address), PAGE_8K * 4);
 	
 	return err;
@@ -129,12 +150,12 @@ void hook_ins(uc_engine *uc, uint64_t address, uint32_t size, void *user_data)
             break;
     }*/
 }
-
-bool hook_invalid_mem(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data)
+		
+bool hook_mem_rw(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data)
 {
 	uc_err err;
 	uint32_t address_align = PAGE_ALIGN(address, PAGE_4K);
-	uint32_t EIP, EAX, ECX;
+	uint32_t EIP;
 
 	unsigned char *data = NULL;
 	
@@ -143,95 +164,66 @@ bool hook_invalid_mem(uc_engine *uc, uc_mem_type type, uint64_t address, int siz
 		mylogprintf(PRINT, "[UniVM] Attempting to access address 0x0. Exiting!\n");
 		return false;
 	}
+
+	uc_reg_read(uc, UC_X86_REG_EIP, &EIP);
+	switch(type)
+	{
+		default:
+			return false;
+		break;
+		case UC_MEM_WRITE:
+			mylogprintf(PRINT, "[UniVM] Hooked write to address %08llX with value %08llX at EIP %08X", address, value, EIP);
+			
+			return true;
+		break;
+		case UC_MEM_READ:
+			mylogprintf(PRINT, "[UniVM] Hooked read from address %08llX at EIP %08X", address, EIP);
+			
+			return true;
+		break;	
+	}
+}
+
+bool hook_invalid_mem(uc_engine *uc, uc_mem_type type, uint64_t address, int size, int64_t value, void *user_data)
+{
+	uc_err err;
+	uint32_t address_align = PAGE_ALIGN(address, PAGE_4K);
+	uint32_t EIP;
+
+	unsigned char *data = NULL;
 	
-	
-		
+	if(address == 0)
+	{
+		mylogprintf(PRINT, "[UniVM] Attempting to access address 0x0. Exiting!\n");
+		return false;
+	}
+
+	uc_reg_read(uc, UC_X86_REG_EIP, &EIP);
 	switch(type)
 	{
 		default:
 			return false;
 		break;
 		case UC_MEM_WRITE_UNMAPPED:
-			uc_reg_read(uc, UC_X86_REG_EIP, &EIP);
 		// there could be data here that needs to change byte by byte so need to copy it 
 			mylogprintf(PRINT, "[UniVM] Mapping write address 0x%08llX to aligned 0x%08X at EIP %08X", address, address_align, EIP);
-			/*
-			err = uc_mem_map(uc, address_align, PAGE_8K, UC_PROT_ALL);
-			if(err != UC_ERR_OK)
-			{
-				mylogprintf(PRINT, "[UniVM] Failed to map memory on UC_MEM_WRITE_UNMAPPED %s\n", uc_strerror(err));
-				return false;
-			}
-			
-			data = new unsigned char[PAGE_8K]();
-			if(!DbgMemRead(LODWORD(address_align), data, PAGE_8K))
-			{
-				if(GetLastError() != 299)
-				{
-					if(!DbgMemRead(LODWORD(address_align), data, LODWORD(address_align) < TIB ? PAGE_4K : 0x30))
-					{
-						mylogprintf(PRINT, "[UniVM] Failed to DbgMemRead at UC_MEM_WRITE_UNMAPPED of 0x%08X with error code %d\n", LODWORD(address_align), GetLastError());
-						delete[] data;
-						return false;
-					}
-				}
-			}
-			
-			err = uc_mem_write(uc, address_align, data, PAGE_8K);
-			if(err != UC_ERR_OK)
-			{
-				delete[] data;
-				mylogprintf(PRINT, "[UniVM] Failed to write data, %s(sz %d)\n", uc_strerror(err), PAGE_8K);
-				return false;
-			}
-			
-			delete[] data;	*/
 
 			if(!generic_map(uc, address, PAGE_8K))
+			{
+				mylogprintf(PRINT, "[UniVM] Failed to map write address");
 				return false;
+			}
 			
 			return true;
 		break;
 		case UC_MEM_READ_UNMAPPED:
-			uc_reg_read(uc, UC_X86_REG_EIP, &EIP);
-			uc_reg_read(uc, UC_X86_REG_EAX, &EAX);
-			uc_reg_read(uc, UC_X86_REG_ECX, &ECX);
-			mylogprintf(PRINT, "[UniVM] Mapping read address 0x%08llX to aligned 0x%08X at EIP %08X, EAX %08X, ECX %08X", address, address_align, EIP, EAX, ECX);
-			
-		/*
-			err = uc_mem_map(uc, address_align, PAGE_8K, UC_PROT_ALL);
-			if(err != UC_ERR_OK)
-			{
-				mylogprintf(PRINT, "[UniVM] Failed to map memory on UC_MEM_READ_UNMAPPED %s\n", uc_strerror(err));
-				return false;
-			}
-			
-			data = new unsigned char[PAGE_8K]();
-			if(!DbgMemRead(LODWORD(address_align), data, PAGE_8K))
-			{
-				if(GetLastError() != 299)
-				{
-					if(!DbgMemRead(LODWORD(address_align), data, LODWORD(address_align) < TIB ? PAGE_4K : 0x30))
-					{
-						mylogprintf(PRINT, "[UniVM] Call to debugger API DbgMemRead at UC_MEM_READ_UNMAPPED of 0x%08X with error code %d\n", LODWORD(address_align), GetLastError());
-						delete[] data;
-						return false;
-					}
-				}
-			}
-			
-			err = uc_mem_write(uc, LODWORD(address_align), data, PAGE_8K);
-			if(err != UC_ERR_OK)
-			{
-				delete[] data;
-				mylogprintf(PRINT, "[UniVM] Failed to write data, %s(sz %d)\n", uc_strerror(err), size);
-				return false;
-			}
-			
-			delete[] data;*/
+			mylogprintf(PRINT, "[UniVM] Mapping read address 0x%08llX to aligned 0x%08X at EIP %08X", address, address_align, EIP);
 			
 			if(!generic_map(uc, address, PAGE_8K))
-				return false;	
+			{
+				mylogprintf(PRINT, "[UniVM] Failed to map read address");
+				return false;
+			}
 			
 			return true;
 		break;		

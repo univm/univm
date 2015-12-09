@@ -39,7 +39,8 @@ uint32_t TIB = 0;
 bool vm_initialized = false;
 bool is_vm_running = false;
 bool vm_stop_req = false;
-uc_engine *uc;
+int single_step = 0;
+uc_engine *uc = NULL;
 uc_err err;
 
 void mylogprintf(enum DBGPRINT print, const char *format, ...)
@@ -156,7 +157,11 @@ void setupSegmentRegs(uc_engine *uc)
 {
 	THREADLIST thrList;
 	
-	DbgGetThreadList(&thrList);
+	memset(&thrList, 0, sizeof(THREADLIST));
+
+	while(thrList.list == NULL) //A call to DbgGetThreadList can fail silently so we loop indefinitely till all threads and modules are loaded.
+		DbgGetThreadList(&thrList);
+	
 	TIB = thrList.list[thrList.CurrentThread].BasicInfo.ThreadLocalBase;
 	uc_reg_write(uc, UC_X86_REG_FS, &TIB);
 	
@@ -183,6 +188,14 @@ uint32_t map_pe(uc_engine *uc)
 	return FileMapVA;
 }
 
+static void VM_singlestep()
+{
+}
+
+static void VM_execall()
+{
+}
+
 static void VM_init()
 {
 	// Initialize emulator in X86-32bit mode
@@ -193,86 +206,117 @@ static void VM_init()
 		return;
 	}
 	
+	vm_stop_req = false;
 	vm_initialized = true;
+	
+	setupSegmentRegs(uc);
 	
 	VM_exec();
 }
 
-static void VM_Stop()
+static void VM_stop()
 {
 	vm_initialized = false;
 	uc_close(uc);
 }
 
+static void VM_reset()
+{
+	unsigned int items;
+	uc_err err;
+	
+	if(mem_map.items == 0)
+		return;
+		
+	for(items = 0; items < mem_map.items; items++)
+	{
+		err = uc_mem_unmap(uc, mem_map.mem_block[items].start, mem_map.mem_block[items].size); //mem_map algorithm is broken
+		if(err != UC_ERR_OK)
+			mylogprintf(PRINT, "[UniVM] Failed on uc_mem_unmap(%08X,%08X) with error returned: %s", mem_map.mem_block[items].start, mem_map.mem_block[items].size, uc_strerror(err));
+	}
+	
+	mem_map.items = 0;
+}
+
 static void VM_exec()
 {
-	uc_hook trace1, trace2;
-	//const  = *(const SELECTIONDATA *)user_data;
+	uc_hook trace1, trace2, trace3;
 	unsigned int len = 0;
-	uint32_t addr = 0;
+	uint32_t addr = 0, start_addr;
 	unsigned int tr_eax, tr_ebx, tr_ecx, tr_edx, tr_ebp, tr_esp, tr_esi, tr_edi, tr_eip, t_eflags;
 	REGDUMP regs;
 	char reg_data[10];
-	
-	if(!vm_initialized)
-		return;
 
 loop:
 	is_vm_running = false;
 	WaitForSingleObject(WaitForStart, INFINITE);
-	
-	DbgGetRegDump(&regs); // TODO
-	
-	VM_ctx.regs[EAX] = tr_eax = regs.regcontext.cax;
-	VM_ctx.regs[EBX] = tr_ebx = regs.regcontext.cbx;
-	VM_ctx.regs[ECX] = tr_ecx = regs.regcontext.ccx;
-	VM_ctx.regs[EDX] = tr_edx = regs.regcontext.cdx;
-	VM_ctx.regs[EBP] = tr_ebp = regs.regcontext.cbp;
-	VM_ctx.regs[ESP] = tr_esp = regs.regcontext.csp;
-	VM_ctx.regs[ESI] = tr_esi = regs.regcontext.csi;
-	VM_ctx.regs[EDI] = tr_edi = regs.regcontext.cdi;
-	VM_ctx.regs[EIP] = tr_eip = regs.regcontext.cip;
-	VM_ctx.regs[EFLAGS] = t_eflags = 0;
 
-	if((unsigned int)sel.start != VM_ctx.regs[EIP])
+	if(vm_stop_req)
+		goto err;
+
+	if(!single_step)
 	{
-		mylogprintf(PRINT, "[UniVM] You want to execute instructions that don't start at EIP(program counter), this won't be supported yet! Exiting!");
-		goto loop;
-	}
+		DbgGetRegDump(&regs); // TODO
 	
-	setupFlagsReg(regs, &VM_ctx.regs[EFLAGS]);
-	setupSegmentRegs(uc);	
-	
-	addr = map_pe(uc);
-	
-	// map stack early on
-	map_stack(uc, VM_ctx.regs[ESP]);	
-	
-	len = sel.end - sel.start + 1;
+		VM_ctx.regs[EAX] = tr_eax = regs.regcontext.cax;
+		VM_ctx.regs[EBX] = tr_ebx = regs.regcontext.cbx;
+		VM_ctx.regs[ECX] = tr_ecx = regs.regcontext.ccx;
+		VM_ctx.regs[EDX] = tr_edx = regs.regcontext.cdx;
+		VM_ctx.regs[EBP] = tr_ebp = regs.regcontext.cbp;
+		VM_ctx.regs[ESP] = tr_esp = regs.regcontext.csp;
+		VM_ctx.regs[ESI] = tr_esi = regs.regcontext.csi;
+		VM_ctx.regs[EDI] = tr_edi = regs.regcontext.cdi;
+		VM_ctx.regs[EIP] = tr_eip = regs.regcontext.cip;
+		VM_ctx.regs[EFLAGS] = t_eflags = 0;
 
-	// initialize machine registers
-	uc_reg_write(uc, UC_X86_REG_EAX, &VM_ctx.regs[EAX]);
-	uc_reg_write(uc, UC_X86_REG_EBX, &VM_ctx.regs[EBX]);
-	uc_reg_write(uc, UC_X86_REG_ECX, &VM_ctx.regs[ECX]);
-	uc_reg_write(uc, UC_X86_REG_EDX, &VM_ctx.regs[EDX]);
-	uc_reg_write(uc, UC_X86_REG_EBP, &VM_ctx.regs[EBP]);
-	uc_reg_write(uc, UC_X86_REG_ESP, &VM_ctx.regs[ESP]);	
-	uc_reg_write(uc, UC_X86_REG_ESI, &VM_ctx.regs[ESI]);
-	uc_reg_write(uc, UC_X86_REG_EDI, &VM_ctx.regs[EDI]);
-	uc_reg_write(uc, UC_X86_REG_EFLAGS, &VM_ctx.regs[EFLAGS]);
+		setupFlagsReg(regs, &VM_ctx.regs[EFLAGS]);
+		
+		if((unsigned int)sel.start != VM_ctx.regs[EIP])
+		{
+			mylogprintf(PRINT, "[UniVM] You want to execute instructions that don't start at EIP(program counter), this won't be supported yet! Exiting!");
+			goto loop;
+		}
+		
+		VM_reset();
 	
-	uc_hook_add(uc, &trace1, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, (void *)hook_invalid_mem, NULL);
-	uc_hook_add(uc, &trace2, UC_HOOK_CODE, (void *)hook_ins, NULL, (uint64_t)1, (uint64_t)0);
+		addr = map_pe(uc);
+	
+		// map stack early on
+		map_stack(uc, VM_ctx.regs[ESP]);
+		
+		start_addr = sel.start;
+		len = sel.end;
+
+		// initialize machine registers
+		uc_reg_write(uc, UC_X86_REG_EAX, &VM_ctx.regs[EAX]);
+		uc_reg_write(uc, UC_X86_REG_EBX, &VM_ctx.regs[EBX]);
+		uc_reg_write(uc, UC_X86_REG_ECX, &VM_ctx.regs[ECX]);
+		uc_reg_write(uc, UC_X86_REG_EDX, &VM_ctx.regs[EDX]);
+		uc_reg_write(uc, UC_X86_REG_EBP, &VM_ctx.regs[EBP]);
+		uc_reg_write(uc, UC_X86_REG_ESP, &VM_ctx.regs[ESP]);	
+		uc_reg_write(uc, UC_X86_REG_ESI, &VM_ctx.regs[ESI]);
+		uc_reg_write(uc, UC_X86_REG_EDI, &VM_ctx.regs[EDI]);
+		uc_reg_write(uc, UC_X86_REG_EFLAGS, &VM_ctx.regs[EFLAGS]);
+	
+		uc_hook_add(uc, &trace1, UC_HOOK_MEM_READ_UNMAPPED | UC_HOOK_MEM_WRITE_UNMAPPED, (void *)hook_invalid_mem, NULL);
+		uc_hook_add(uc, &trace2, UC_HOOK_MEM_WRITE | UC_HOOK_MEM_READ, (void *)hook_mem_rw, NULL);
+		uc_hook_add(uc, &trace3, UC_HOOK_CODE, (void *)hook_ins, NULL, (uint64_t)1, (uint64_t)0);		
+	}
+	else
+	{
+		start_addr = VM_ctx.regs[EIP];
+		len = VM_ctx.regs[EIP] + 1 + 0xF;		
+	}
 	
 	is_vm_running = true;
 	base = uc;
 
 	// emulate machine code in infinite time
-	err = uc_emu_start(uc, sel.start, sel.start + (len), 0, 0);
+	err = uc_emu_start(uc, start_addr, len + 1, 0, single_step);
 	if(err)
 	{
 		uc_reg_read(uc, UC_X86_REG_EIP, &VM_ctx.regs[EIP]);
-		mylogprintf(PRINT, "[UniVM] Failed on uc_emu_start() at address 0x%08X with error returned %u: %s", VM_ctx.regs[EIP], err, uc_strerror(err));
+		mylogprintf(PRINT, "[UniVM] Failed on uc_emu_start(%08X,%08X) at address 0x%08X with error returned %u: %s", sel.start, sel.end, VM_ctx.regs[EIP], err, uc_strerror(err));
 		
 		goto err;
 	}
@@ -294,6 +338,7 @@ loop:
 		SendMessageTimeout(g_regs[i], WM_SETTEXT, NULL, reg_data, SMTO_NORMAL, 100, NULL);
 	}
 	
+	single_step = 0;
 	
 	if(vm_stop_req)
 		goto err;
@@ -312,11 +357,11 @@ loop:
 	mylogprintf(S_PRINT, "[UniVM] >>> EDI = 0x%08X %s\n", r_edi, (r_edi == tr_edi ? "" : "(m)"));
 	mylogprintf(S_PRINT, "[UniVM] >>> EIP = 0x%08X %s\n", r_eip, (r_eip == tr_eip ? "" : "(m)"));
 	mylogprintf(S_PRINT, "[UniVM] >>> EFLAGS = 0x%08X %s\n", eflags, (eflags == t_eflags ? "" : "(m)"));	
-*/	
+	
 	mylogprintf(S_PRINT, "[UniVM] >>> Instructions executed %llu", instructions);
 	mylogprintf(FLUSH, NULL);
 
-/*	for(int i = 0; i < mem_map.items; i++)
+	for(int i = 0; i < mem_map.items; i++)
 	{
 		mylogprintf(PRINT, "[UniVM] >>> Mem block %08X...%08X", mem_map.mem_block[i].start, mem_map.mem_block[i].end);
 	}
@@ -325,8 +370,10 @@ err:
 	is_vm_running = false;
 	instructions = 0;
 	mem_map.items = 0;
-	VM_Stop();
-	//window?
+	VM_stop();
+	
+	ExitThread(0);
+	//SendMessageTimeout(hwnd, WM_DESTROY, NULL, NULL, SMTO_NORMAL, 100, NULL);
 }
 
 int StartVM()
@@ -336,17 +383,23 @@ int StartVM()
 	return 1;
 }
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, 
-    WPARAM wParam, LPARAM lParam)
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-  switch(msg)  
-  {
-    case WM_DESTROY:
-      PostQuitMessage(0);
-      return 0;
-  }
+	switch(msg)  
+	{
+		case WM_COMMAND:
+		if(LOWORD(wParam)==3133)
+		{
+			single_step = 1;
+			SetEvent(WaitForStart);
+		}
+		break;
+		case WM_DESTROY:
+			PostQuitMessage(0);
+		return 0;
+	}
 
-  return DefWindowProc(hwnd, msg, wParam, lParam);
+	return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 void WindowThread()
@@ -436,19 +489,26 @@ void WindowThread()
 	SendMessage(g_regs[9],WM_SETFONT,(WPARAM)hFont,0);
 	
 
-	
-	CreateWindowEx(WS_EX_LEFT, "Button", "Stop",
-                      WS_VISIBLE | WS_CHILD,
-                      90, 330, 45, 28,
-                      hwnd,
-                      NULL, hInstance, NULL);
+
 	CreateWindowEx(WS_EX_LEFT, "Button", "Start",
                       WS_VISIBLE | WS_CHILD,
                       40, 330, 45, 28,
                       hwnd,
-                      NULL, hInstance, NULL);
+                      (HMENU)3132, hInstance, NULL);
+					  
+	CreateWindowEx(WS_EX_LEFT, "Button", "Stop",
+                      WS_VISIBLE | WS_CHILD,
+                      90, 330, 45, 28,
+                      hwnd,
+                      (HMENU)3131, hInstance, NULL);
 
-	
+	CreateWindowEx(WS_EX_LEFT, "Button", "Step",
+                      WS_VISIBLE | WS_CHILD,
+                      140, 330, 45, 28,
+                      hwnd,
+                      (HMENU)3133, hInstance, NULL);					  
+
+
 	while(GetMessage(&msg, NULL, 0, 0))
 	{
 		DispatchMessage(&msg);
@@ -475,6 +535,7 @@ extern "C" __declspec(dllexport) void CBINITDEBUG(CBTYPE cbType, PLUG_CB_INITDEB
 {
 	if(CreateThread(NULL, 0, WindowThread, NULL, 0, NULL) == NULL)
 		mylogprintf(PRINT, "Failed to create GUI thread with error code %d", GetLastError());
+		//handle thread creation failure here
 		
 	WaitForStart = CreateEvent(NULL, FALSE, FALSE, "WaitForStart");
 	
@@ -485,6 +546,8 @@ extern "C" __declspec(dllexport) void CBINITDEBUG(CBTYPE cbType, PLUG_CB_INITDEB
 
 extern "C" __declspec(dllexport) void CBSTOPDEBUG(CBTYPE cbType, PLUG_CB_STOPDEBUG* info)
 {
+	vm_stop_req = true;
+	SetEvent(WaitForStart);
 	SendMessage(hwnd, WM_DESTROY, 0, 0);
 	CloseHandle(WaitForStart);
 }
@@ -505,6 +568,10 @@ extern "C" __declspec(dllexport) void CBMENUENTRY(CBTYPE cbType, PLUG_CB_MENUENT
 				memset(&sel, 0, sizeof(SELECTIONDATA));
 				GuiSelectionGet(GUI_DISASSEMBLY, &sel);
 				SetEvent(WaitForStart);
+			}
+			else
+			{
+				_plugin_logputs("VM is running.");
 			}
 			//StartVM(sel);
 		}
